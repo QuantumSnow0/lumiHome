@@ -21,148 +21,284 @@ import {
   ChefHat,
   Sofa,
   TreePine,
+  Clock,
 } from "lucide-react-native";
 import { StatusBar } from "expo-status-bar";
 
-const WS_URL = "ws://192.168.0.200:81";
+const WS_URL = "ws://192.168.0.200:81"; // match ESP static IP
+const AUTO_OFF_SEC = 3600; // 🔥 one hour = 3600s
 
 export default function LightControl() {
   const ws = useRef(null);
   const insets = useSafeAreaInsets();
 
   const [rooms, setRooms] = useState([
-    { id: "relay1", name: "Kitchen", icon: ChefHat, isOn: false },
-    { id: "relay2", name: "Corridor", icon: Home, isOn: false },
-    { id: "relay3", name: "Bedroom", icon: Bed, isOn: false },
-    { id: "relay4", name: "Sitting Room", icon: Sofa, isOn: false },
-    { id: "relay5", name: "Outside Light", icon: TreePine, isOn: false },
+    {
+      id: "relay1",
+      name: "Kitchen",
+      icon: ChefHat,
+      isOn: false,
+      time: 0,
+      countdown: null,
+    },
+    {
+      id: "relay2",
+      name: "Corridor",
+      icon: Home,
+      isOn: false,
+      time: 0,
+      countdown: null,
+    },
+    {
+      id: "relay3",
+      name: "Bedroom",
+      icon: Bed,
+      isOn: false,
+      time: 0,
+      countdown: null,
+    },
+    {
+      id: "relay4",
+      name: "Sitting Room",
+      icon: Sofa,
+      isOn: false,
+      time: 0,
+      countdown: null,
+    },
+    {
+      id: "relay5",
+      name: "Outside Light",
+      icon: TreePine,
+      isOn: false,
+      time: 0,
+      countdown: null,
+    },
   ]);
 
   const [connected, setConnected] = useState(false);
-  const [blink, setBlink] = useState(false);
+  const [dotVisible, setDotVisible] = useState(true);
+
+  // stable refs
   const lastPongRef = useRef(Date.now());
   const reconnectRef = useRef({ attempt: 0, timeout: null });
+  const sendQueueRef = useRef([]);
+  const countdownRefs = useRef({}); // timers for countdowns
 
-  // Blink indicator
+  // 🔴🟢 blinking dot effect
   useEffect(() => {
-    const interval = setInterval(() => setBlink((b) => !b), 500);
-    return () => clearInterval(interval);
+    const iv = setInterval(() => {
+      setDotVisible((prev) => !prev);
+    }, 600);
+    return () => clearInterval(iv);
   }, []);
 
-  // Send JSON helper
+  // tick ON-time
+  useEffect(() => {
+    const iv = setInterval(() => {
+      setRooms((prev) =>
+        prev.map((r) => (r.isOn ? { ...r, time: r.time + 1 } : r))
+      );
+    }, 1000);
+    return () => clearInterval(iv);
+  }, []);
+
+  // safe send
   const sendJson = useCallback((obj) => {
-    if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+    if (ws.current?.readyState === WebSocket.OPEN) {
       ws.current.send(JSON.stringify(obj));
     } else {
-      console.log("⚠️ WebSocket not open, ignoring:", obj);
+      sendQueueRef.current.push(obj);
     }
   }, []);
 
-  // WebSocket connect
+  const flushQueue = useCallback(() => {
+    if (
+      ws.current?.readyState === WebSocket.OPEN &&
+      sendQueueRef.current.length
+    ) {
+      const q = sendQueueRef.current.splice(0);
+      q.forEach((obj) => ws.current.send(JSON.stringify(obj)));
+    }
+  }, []);
+
+  // start or reset countdown
+  const startCountdown = useCallback(
+    (roomId, seconds = AUTO_OFF_SEC) => {
+      if (countdownRefs.current[roomId]) {
+        clearInterval(countdownRefs.current[roomId]);
+      }
+      setRooms((prev) =>
+        prev.map((r) => (r.id === roomId ? { ...r, countdown: seconds } : r))
+      );
+
+      countdownRefs.current[roomId] = setInterval(() => {
+        setRooms((prev) =>
+          prev.map((r) => {
+            if (r.id === roomId && r.countdown !== null) {
+              if (r.countdown <= 1) {
+                clearInterval(countdownRefs.current[roomId]);
+                delete countdownRefs.current[roomId];
+                sendJson({ [roomId]: false }); // auto turn off
+                return { ...r, isOn: false, countdown: null };
+              }
+              return { ...r, countdown: r.countdown - 1 };
+            }
+            return r;
+          })
+        );
+      }, 1000);
+    },
+    [sendJson]
+  );
+
+  const cancelCountdown = useCallback((roomId) => {
+    if (countdownRefs.current[roomId]) {
+      clearInterval(countdownRefs.current[roomId]);
+      delete countdownRefs.current[roomId];
+    }
+    setRooms((prev) =>
+      prev.map((r) => (r.id === roomId ? { ...r, countdown: null } : r))
+    );
+  }, []);
+
+  // websocket connect
   const connectWebSocket = useCallback(() => {
-    // Close previous socket if exists
+    if (ws.current?.readyState === WebSocket.OPEN) return;
     if (ws.current) {
-      ws.current.onopen = null;
-      ws.current.onmessage = null;
-      ws.current.onclose = null;
-      ws.current.onerror = null;
-      ws.current.close();
+      try {
+        ws.current.close();
+      } catch {}
       ws.current = null;
     }
 
     ws.current = new WebSocket(WS_URL);
 
     ws.current.onopen = () => {
-      console.log("✅ Connected to ESP32");
       setConnected(true);
       reconnectRef.current.attempt = 0;
       sendJson({ action: "getState" });
+      flushQueue();
     };
 
     ws.current.onmessage = (m) => {
       try {
         const data = JSON.parse(m.data);
-
         if (data.pong) {
           lastPongRef.current = Date.now();
-          if (!connected) setConnected(true);
           return;
         }
-
-        // Update room states from ESP32
         setRooms((prev) =>
-          prev.map((room) =>
-            data.hasOwnProperty(room.id)
-              ? { ...room, isOn: !!data[room.id] }
-              : room
-          )
+          prev.map((room) => {
+            const timeKey = `${room.id}_time`;
+            let updated = {
+              ...room,
+              isOn: data.hasOwnProperty(room.id) ? !!data[room.id] : room.isOn,
+              time: data.hasOwnProperty(timeKey) ? data[timeKey] : room.time,
+            };
+            if (updated.isOn && updated.countdown === null) {
+              startCountdown(room.id, AUTO_OFF_SEC);
+            }
+            if (!updated.isOn && updated.countdown !== null) {
+              cancelCountdown(room.id);
+            }
+            return updated;
+          })
         );
-      } catch (err) {
-        console.log("⚠️ JSON parse error:", err);
-      }
+      } catch {}
     };
 
-    ws.current.onerror = (e) => console.log("❌ WebSocket error:", e.message);
-
     ws.current.onclose = () => {
-      console.log("🔌 Disconnected from ESP32");
       setConnected(false);
-
-      // schedule reconnection
-      const attempt = reconnectRef.current.attempt;
+      const attempt = reconnectRef.current.attempt || 0;
       const delay = Math.min(30000, 1000 * 2 ** attempt);
-      console.log(`🔄 Reconnecting in ${delay / 1000}s...`);
-
-      if (reconnectRef.current.timeout)
-        clearTimeout(reconnectRef.current.timeout);
-
       reconnectRef.current.timeout = setTimeout(() => {
-        reconnectRef.current.attempt += 1;
+        reconnectRef.current.attempt = Math.min(30, attempt + 1);
         connectWebSocket();
       }, delay);
     };
-  }, [connected, sendJson]);
+  }, [flushQueue, sendJson, startCountdown, cancelCountdown]);
 
   useEffect(() => {
     connectWebSocket();
     return () => {
-      if (ws.current) ws.current.close();
+      if (ws.current)
+        try {
+          ws.current.close();
+        } catch {}
       if (reconnectRef.current.timeout)
         clearTimeout(reconnectRef.current.timeout);
+      Object.values(countdownRefs.current).forEach(clearInterval);
     };
   }, [connectWebSocket]);
 
-  // Heartbeat ping
+  // heartbeat
   useEffect(() => {
-    const interval = setInterval(() => {
-      if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-        ws.current.send(JSON.stringify({ ping: true }));
-      } else {
+    const iv = setInterval(() => {
+      try {
+        if (ws.current?.readyState === WebSocket.OPEN) {
+          ws.current.send(JSON.stringify({ ping: true }));
+        }
+      } catch {}
+      if (Date.now() - lastPongRef.current > 15000) {
+        if (ws.current)
+          try {
+            ws.current.close();
+          } catch {}
         setConnected(false);
       }
-
-      if (Date.now() - lastPongRef.current > 3000) {
-        setConnected(false);
-      }
-    }, 1000);
-    return () => clearInterval(interval);
+    }, 5000);
+    return () => clearInterval(iv);
   }, []);
 
-  // Toggle light
+  // toggle individual
   const toggleLight = useCallback(
     (roomId, currentState) => {
-      sendJson({ [roomId]: !currentState });
+      if (!connected) return;
+      const newState = !currentState;
+      if (newState) {
+        startCountdown(roomId, AUTO_OFF_SEC);
+        sendJson({ [roomId]: true, auto_off_sec: AUTO_OFF_SEC });
+      } else {
+        cancelCountdown(roomId);
+        sendJson({ [roomId]: false });
+      }
+      setRooms((prev) =>
+        prev.map((r) => (r.id === roomId ? { ...r, isOn: newState } : r))
+      );
     },
-    [sendJson]
+    [sendJson, startCountdown, cancelCountdown, connected]
   );
 
-  const turnAllLightsOn = () => sendJson({ all: true });
-  const turnAllLightsOff = () => sendJson({ all: false });
+  // all on/off
+  const turnAllLightsOn = () => {
+    if (!connected) return;
+    setRooms((prev) => prev.map((r) => ({ ...r, isOn: true })));
+    rooms.forEach((r) => startCountdown(r.id, AUTO_OFF_SEC));
+    sendJson({ all: true, auto_off_sec: AUTO_OFF_SEC });
+  };
+
+  const turnAllLightsOff = () => {
+    if (!connected) return;
+    setRooms((prev) =>
+      prev.map((r) => ({ ...r, isOn: false, countdown: null }))
+    );
+    Object.keys(countdownRefs.current).forEach(cancelCountdown);
+    sendJson({ all: false });
+  };
 
   const totalLightsOn = useMemo(
     () => rooms.filter((r) => r.isOn).length,
     [rooms]
   );
+
+  const formatTime = (sec) => {
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = sec % 60;
+    return `${h.toString().padStart(2, "0")}:${m
+      .toString()
+      .padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
+  };
 
   const renderRoom = ({ item: room }) => {
     const IconComponent = room.icon;
@@ -171,8 +307,10 @@ export default function LightControl() {
         style={[
           styles.card,
           { borderColor: room.isOn ? "#f87171" : "#334155" },
+          !connected && { opacity: 0.4 },
         ]}
         onPress={() => toggleLight(room.id, room.isOn)}
+        disabled={!connected}
       >
         <View style={styles.cardHeader}>
           <View style={styles.roomInfo}>
@@ -189,40 +327,27 @@ export default function LightControl() {
             </View>
             <Text style={styles.roomName}>{room.name}</Text>
           </View>
-          <View
-            style={[
-              styles.statusBox,
-              {
-                backgroundColor: room.isOn
-                  ? "rgba(248,113,113,0.1)"
-                  : "#334155",
-              },
-            ]}
+          <Text
+            style={{ color: room.isOn ? "#f87171" : "#94a3b8", fontSize: 12 }}
           >
-            <View
-              style={[
-                styles.statusDot,
-                { backgroundColor: room.isOn ? "#f87171" : "#94a3b8" },
-              ]}
-            />
-            <Text
-              style={{ color: room.isOn ? "#f87171" : "#94a3b8", fontSize: 12 }}
-            >
-              {room.isOn ? "ON" : "OFF"}
-            </Text>
-          </View>
+            {room.isOn ? "ON" : "OFF"}
+          </Text>
         </View>
 
         <View style={styles.row}>
           <View style={styles.row}>
-            <Lightbulb size={16} color={room.isOn ? "#f87171" : "#94a3b8"} />
-            <Text style={styles.lightText}>
-              {room.isOn ? "Light is on" : "Light is off"}
-            </Text>
+            <Clock size={16} color="#94a3b8" />
+            <Text style={styles.lightText}>{formatTime(room.time)}</Text>
           </View>
+          {room.countdown !== null && (
+            <Text style={styles.countdown}>
+              Auto-off in {formatTime(room.countdown)}
+            </Text>
+          )}
           <Switch
             value={room.isOn}
             onValueChange={() => toggleLight(room.id, room.isOn)}
+            disabled={!connected}
           />
         </View>
       </TouchableOpacity>
@@ -237,25 +362,18 @@ export default function LightControl() {
       ]}
     >
       <StatusBar style="light" />
-
       <View style={styles.header}>
         <View style={styles.headerRow}>
           <Lightbulb size={32} color="#f87171" />
           <Text style={styles.title}>Smart Home Lighting</Text>
         </View>
-
-        <View style={styles.statusChip}>
+        <View style={styles.statusRow}>
           <View
             style={[
-              styles.statusDot,
+              styles.dot,
               {
-                backgroundColor: connected
-                  ? blink
-                    ? "#22c55e"
-                    : "#334155"
-                  : blink
-                  ? "#ef4444"
-                  : "#334155",
+                backgroundColor: connected ? "green" : "red",
+                opacity: dotVisible ? 1 : 0.2,
               },
             ]}
           />
@@ -264,53 +382,44 @@ export default function LightControl() {
           </Text>
         </View>
       </View>
-
       <FlatList
         data={rooms}
         keyExtractor={(item) => item.id}
         renderItem={renderRoom}
-        contentContainerStyle={{ paddingBottom: 20 }}
       />
-
       <View style={styles.quickControls}>
-        <Text style={styles.quickTitle}>Quick Controls</Text>
-        <View style={styles.quickRow}>
-          <TouchableOpacity style={styles.onButton} onPress={turnAllLightsOn}>
-            <Lightbulb size={20} color="white" />
-            <Text style={styles.btnText}>All Lights On</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.offButton} onPress={turnAllLightsOff}>
-            <Lightbulb size={20} color="#94a3b8" />
-            <Text style={styles.offBtnText}>All Lights Off</Text>
-          </TouchableOpacity>
-        </View>
+        <TouchableOpacity
+          style={[styles.onButton, !connected && { opacity: 0.4 }]}
+          onPress={turnAllLightsOn}
+          disabled={!connected}
+        >
+          <Text style={styles.btnText}>All Lights On (1h)</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.offButton, !connected && { opacity: 0.4 }]}
+          onPress={turnAllLightsOff}
+          disabled={!connected}
+        >
+          <Text style={styles.offBtnText}>All Lights Off</Text>
+        </TouchableOpacity>
       </View>
     </View>
   );
 }
 
-// Styles remain unchanged
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#0f172a", padding: 16 },
   header: { alignItems: "center", marginBottom: 20 },
   headerRow: { flexDirection: "row", alignItems: "center", marginBottom: 8 },
-  title: { fontSize: 24, fontWeight: "bold", color: "white", marginLeft: 8 },
-  statusChip: {
-    flexDirection: "row",
-    alignItems: "center",
-    backgroundColor: "#1e293b",
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 20,
-  },
-  statusDot: { width: 8, height: 8, borderRadius: 4, marginRight: 6 },
-  statusText: { color: "white", fontSize: 12 },
+  title: { fontSize: 22, fontWeight: "bold", color: "white", marginLeft: 8 },
+  statusRow: { flexDirection: "row", alignItems: "center" },
+  dot: { width: 12, height: 12, borderRadius: 6, marginRight: 8 },
+  statusText: { color: "white", fontSize: 14 },
   card: {
     backgroundColor: "#1e293b",
     borderRadius: 16,
     padding: 16,
     borderWidth: 1,
-    borderColor: "#334155",
     marginBottom: 12,
   },
   cardHeader: {
@@ -321,41 +430,21 @@ const styles = StyleSheet.create({
   roomInfo: { flexDirection: "row", alignItems: "center" },
   iconBox: { padding: 6, borderRadius: 8 },
   roomName: { fontSize: 16, fontWeight: "600", color: "white", marginLeft: 8 },
-  statusBox: {
-    flexDirection: "row",
-    alignItems: "center",
-    borderRadius: 12,
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-  },
   row: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    marginBottom: 10,
   },
   lightText: { color: "#94a3b8", marginLeft: 6, fontSize: 14 },
+  countdown: { color: "#f87171", fontSize: 12, marginLeft: 10 },
   quickControls: {
-    backgroundColor: "#1e293b",
-    borderRadius: 16,
-    padding: 16,
-    borderWidth: 1,
-    borderColor: "#334155",
+    flexDirection: "row",
+    marginTop: 16,
+    justifyContent: "space-between",
   },
-  quickTitle: {
-    color: "white",
-    fontWeight: "600",
-    fontSize: 16,
-    textAlign: "center",
-    marginBottom: 12,
-  },
-  quickRow: { flexDirection: "row", justifyContent: "space-between" },
   onButton: {
     flex: 1,
     backgroundColor: "#f87171",
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
     padding: 12,
     borderRadius: 12,
     marginRight: 6,
@@ -363,13 +452,10 @@ const styles = StyleSheet.create({
   offButton: {
     flex: 1,
     backgroundColor: "#334155",
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
     padding: 12,
     borderRadius: 12,
     marginLeft: 6,
   },
-  btnText: { color: "white", fontWeight: "600", marginLeft: 6 },
-  offBtnText: { color: "#94a3b8", fontWeight: "600", marginLeft: 6 },
+  btnText: { color: "white", fontWeight: "600", textAlign: "center" },
+  offBtnText: { color: "#94a3b8", fontWeight: "600", textAlign: "center" },
 });
